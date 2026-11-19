@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from typing import Dict, Any
-import requests
+from urllib.request import Request, urlopen
 
 class LLMReviewProcessor:
     def __init__(self, api_key: str = None):
@@ -41,9 +41,14 @@ class LLMReviewProcessor:
         }
 
         try:
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=10)
-            response.raise_for_status()
-            result = response.json()
+            request = Request(
+                self.endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urlopen(request, timeout=10) as response:
+                result = json.loads(response.read().decode("utf-8"))
             content = json.loads(result["choices"]["message"]["content"])
             return {"review_id": review["review_id"], **content}
         except Exception as e:
