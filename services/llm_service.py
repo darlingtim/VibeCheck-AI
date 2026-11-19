@@ -1,8 +1,89 @@
 import os
 import json
 import logging
+import re
+import traceback
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Dict, Any
 from urllib.request import Request, urlopen
+
+def _load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE entries without requiring an external package."""
+    if not path.is_file():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+_load_env_file(Path(__file__).resolve().parents[1] / ".env")
+
+LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "llm_service.log"
+ERROR_LOG_DIR = LOG_FILE.parent / "errors"
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if not any(
+        isinstance(handler, RotatingFileHandler)
+        and Path(handler.baseFilename).resolve() == LOG_FILE.resolve()
+        for handler in logger.handlers
+    ):
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logger.addHandler(handler)
+
+    return logger
+
+
+logger = _get_logger()
+
+
+def _write_error_log(review_id: Any, error: Exception) -> None:
+    """Write one diagnostic file for an individual failed API attempt."""
+    timestamp = datetime.now(timezone.utc)
+    safe_review_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(review_id))
+    error_file = ERROR_LOG_DIR / (
+        f"llm_error_{timestamp.strftime('%Y%m%dT%H%M%S_%fZ')}_{safe_review_id}.log"
+    )
+    ERROR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    error_file.write_text(
+        "\n".join(
+            [
+                f"timestamp_utc={timestamp.isoformat()}",
+                f"review_id={review_id}",
+                f"error_type={type(error).__name__}",
+                f"error={error}",
+                "",
+                "traceback:",
+                traceback.format_exc(),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
 
 class LLMReviewProcessor:
     def __init__(self, api_key: str = None):
@@ -23,12 +104,17 @@ class LLMReviewProcessor:
         # Local fallback mock response if no API key is set
         if not self.api_key:
             is_bathroom = "bathroom" in review["text"].lower()
-            return {
+            result = {
                 "review_id": review["review_id"],
                 "sentiment": "Negative" if is_bathroom else "Positive",
                 "primary_theme": "Bathrooms" if is_bathroom else "Sound",
                 "urgency": 4 if is_bathroom else 1
             }
+            logger.info(
+                "review_id=%s outcome=success mode=local_fallback",
+                review["review_id"],
+            )
+            return result
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -49,8 +135,25 @@ class LLMReviewProcessor:
             )
             with urlopen(request, timeout=10) as response:
                 result = json.loads(response.read().decode("utf-8"))
-            content = json.loads(result["choices"]["message"]["content"])
-            return {"review_id": review["review_id"], **content}
+            content = json.loads(result["choices"][0]["message"]["content"])
+            analyzed_review = {"review_id": review["review_id"], **content}
+            logger.info(
+                "review_id=%s outcome=success mode=api",
+                review["review_id"],
+            )
+            return analyzed_review
         except Exception as e:
-            logging.error(f"API Error on review {review['review_id']}: {e}")
+            logger.error(
+                "review_id=%s outcome=failure error_type=%s error=%s",
+                review["review_id"],
+                type(e).__name__,
+                e,
+            )
+            try:
+                _write_error_log(review["review_id"], e)
+            except OSError:
+                logger.exception(
+                    "review_id=%s outcome=failure error_log_write_failed",
+                    review["review_id"],
+                )
             return {"review_id": review["review_id"], "error": str(e)}
