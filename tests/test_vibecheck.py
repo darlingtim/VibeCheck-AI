@@ -1,4 +1,3 @@
-import pytest
 from validation.validator import ReviewIngestionPipeline
 from core.calculator import MetricsCalculator
 
